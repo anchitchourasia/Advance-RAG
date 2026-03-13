@@ -37,7 +37,7 @@ if PROXY_CONFIG.get("enabled"):
         pc_kwargs["ssl_ca_certs"] = SSL_CA_CERTS
 
 
-_pc    = Pinecone(**pc_kwargs)
+_pc = Pinecone(**pc_kwargs)
 _index = _pc.Index(host=PINECONE_INDEX_HOST)
 _embedder = SentenceTransformer(EMBED_MODEL)
 
@@ -67,6 +67,38 @@ def embed_query(text):
     return vectors[0] if vectors else []
 
 
+def _coerce_metadata(obj):
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+def _extract_text_from_metadata(metadata):
+    metadata = _coerce_metadata(metadata)
+    return (
+        metadata.get("chunk_text")
+        or metadata.get("text")
+        or metadata.get("content")
+        or metadata.get("body")
+        or ""
+    )
+
+
+def _normalize_filter(metadata_filter):
+    if not metadata_filter or not isinstance(metadata_filter, dict):
+        return None
+    return metadata_filter
+
+
+def _merge_filters(*filters):
+    valid_filters = [f for f in filters if isinstance(f, dict) and f]
+    if not valid_filters:
+        return None
+    if len(valid_filters) == 1:
+        return valid_filters[0]
+    return {"$and": valid_filters}
+
+
 def parse_matches(result):
     matches = (
         result["matches"]
@@ -76,14 +108,21 @@ def parse_matches(result):
     parsed = []
 
     for m in matches:
-        score    = m["score"]    if isinstance(m, dict) else getattr(m, "score",    0.0)
+        score = m["score"] if isinstance(m, dict) else getattr(m, "score", 0.0)
         metadata = m["metadata"] if isinstance(m, dict) else getattr(m, "metadata", {})
-        match_id = m["id"]       if isinstance(m, dict) else getattr(m, "id",       "")
+        match_id = m["id"] if isinstance(m, dict) else getattr(m, "id", "")
+        values = m.get("values") if isinstance(m, dict) else getattr(m, "values", None)
+
+        metadata = _coerce_metadata(metadata)
+        text_value = _extract_text_from_metadata(metadata)
 
         parsed.append({
-            "id":       match_id,
-            "score":    float(score),
-            "metadata": metadata or {}
+            "id": match_id,
+            "score": float(score),
+            "metadata": metadata,
+            "text": text_value,
+            "chunk_text": text_value,
+            "values": values,
         })
 
     return parsed
@@ -106,10 +145,14 @@ def parse_fetch_records(payload):
     parsed = []
     for r in records:
         if isinstance(r, dict):
+            metadata = _coerce_metadata(r.get("metadata", {}) or {})
+            text_value = _extract_text_from_metadata(metadata)
             parsed.append({
-                "id":       r.get("id") or r.get("_id", ""),
-                "score":    float(r.get("score", 1.0) or 1.0),
-                "metadata": r.get("metadata", {}) or {}
+                "id": r.get("id") or r.get("_id", ""),
+                "score": float(r.get("score", 1.0) or 1.0),
+                "metadata": metadata,
+                "text": text_value,
+                "chunk_text": text_value,
             })
 
     return parsed
@@ -126,7 +169,7 @@ def _requests_kwargs():
     if PROXY_CONFIG.get("enabled") and PROXY_CONFIG.get("proxy_url_base"):
         proxy_url = PROXY_CONFIG["proxy_url_base"]
         kwargs["proxies"] = {
-            "http":  proxy_url,
+            "http": proxy_url,
             "https": proxy_url,
         }
 
@@ -139,18 +182,23 @@ def query_namespace(
     top_k=5,
     metadata_filter=None,
     include_metadata=True,
+    include_values=False,
 ):
     vector = embed_query(query_text)
     if not vector:
         return []
 
     kwargs = {
-        "namespace":        namespace,
-        "vector":           vector,
-        "top_k":            top_k,
+        "namespace": namespace,
+        "vector": vector,
+        "top_k": top_k,
         "include_metadata": include_metadata,
     }
 
+    if include_values:
+        kwargs["include_values"] = True
+
+    metadata_filter = _normalize_filter(metadata_filter)
     if metadata_filter:
         kwargs["filter"] = metadata_filter
 
@@ -184,14 +232,14 @@ def exact_metadata_lookup(
 def fetch_by_metadata(namespace, metadata_filter, limit=10):
     url = f"https://{PINECONE_INDEX_HOST}/vectors/fetch_by_metadata"
     headers = {
-        "Api-Key":                 PINECONE_API_KEY,
-        "Content-Type":            "application/json",
-        "X-Pinecone-API-Version":  "2025-10",
+        "Api-Key": PINECONE_API_KEY,
+        "Content-Type": "application/json",
+        "X-Pinecone-API-Version": "2025-10",
     }
     payload = {
         "namespace": namespace,
-        "filter":    metadata_filter,
-        "limit":     limit,
+        "filter": metadata_filter,
+        "limit": limit,
     }
 
     response = requests.post(
@@ -210,7 +258,6 @@ def lookup_case_by_order_id(namespace, order_id, query_text=None, top_k=5):
 
     metadata_filter = {"order_id": {"$eq": order_id}}
 
-    # Try fetch_by_metadata first (exact, no vector needed)
     try:
         fetched = fetch_by_metadata(
             namespace=namespace,
@@ -222,7 +269,6 @@ def lookup_case_by_order_id(namespace, order_id, query_text=None, top_k=5):
     except Exception:
         pass
 
-    # Fallback to filtered vector search
     lookup_text = query_text or f"order id {order_id}"
     return exact_metadata_lookup(
         namespace=namespace,
@@ -241,15 +287,8 @@ def hybrid_case_search(
     extra_filter=None,
     top_k=5,
 ):
-    metadata_filter = None
-
-    if order_id:
-        metadata_filter = {"order_id": {"$eq": order_id}}
-
-    if extra_filter and metadata_filter:
-        metadata_filter = {"$and": [metadata_filter, extra_filter]}
-    elif extra_filter:
-        metadata_filter = extra_filter
+    order_filter = {"order_id": {"$eq": order_id}} if order_id else None
+    metadata_filter = _merge_filters(order_filter, extra_filter)
 
     return query_namespace(
         namespace=namespace,

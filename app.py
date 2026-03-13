@@ -1,8 +1,14 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from pathlib import Path
+import uuid
 import streamlit as st
 
 from config import APP_NAME
 from graph.builder import build_graph
+from utils.langsmith_tracing import traceable, maybe_tracing_context
+
 
 st.set_page_config(
     page_title=APP_NAME,
@@ -10,9 +16,11 @@ st.set_page_config(
     layout="wide",
 )
 
+
 graph = build_graph()
 upload_dir = Path("artifacts/uploads")
 upload_dir.mkdir(parents=True, exist_ok=True)
+
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -25,6 +33,24 @@ if "uploaded_image_name" not in st.session_state:
 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = str(uuid.uuid4())
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+
+
+@traceable(
+    name="streamlit_graph_invoke",
+    tags=["app", "streamlit", "support-agent"],
+    metadata={"surface": "streamlit-chat"},
+)
+def invoke_graph_with_trace(graph_obj, state: dict, config: dict):
+    return graph_obj.invoke(state, config=config)
 
 
 def remove_image():
@@ -39,6 +65,7 @@ def reset_chat():
     st.session_state.uploaded_image_path = None
     st.session_state.uploaded_image_name = None
     st.session_state.uploader_key += 1
+    st.session_state.thread_id = str(uuid.uuid4())
     st.rerun()
 
 
@@ -74,6 +101,12 @@ with st.sidebar:
     with col2:
         st.button("Reset chat", use_container_width=True, on_click=reset_chat)
 
+    with st.expander("Session info"):
+        st.caption(f"user_id: {st.session_state.user_id}")
+        st.caption(f"session_id: {st.session_state.session_id}")
+        st.caption(f"thread_id: {st.session_state.thread_id}")
+
+
 st.title(APP_NAME)
 st.caption("Chat naturally, or ask order, refund, return, damage, or policy questions.")
 
@@ -104,9 +137,23 @@ if user_query:
                 "query": user_query,
                 "image_path": st.session_state.uploaded_image_path,
                 "chat_history": st.session_state.messages[-8:],
+                "messages": st.session_state.messages[-8:],
+                "user_id": st.session_state.user_id,
+                "session_id": st.session_state.session_id,
+                "thread_id": st.session_state.thread_id,
             }
 
-            result = graph.invoke(state)
+            config = {
+                "configurable": {
+                    "thread_id": st.session_state.thread_id,
+                    "user_id": st.session_state.user_id,
+                    "session_id": st.session_state.session_id,
+                }
+            }
+
+            with maybe_tracing_context(project_name="support-intelligence-agent"):
+                result = invoke_graph_with_trace(graph, state, config)
+
             answer = result.get("final_answer", "I could not generate a response.")
             st.markdown(answer)
 
