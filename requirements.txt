@@ -1,0 +1,9 @@
+streamlit
+pinecone
+sentence-transformers
+google-genai
+langgraph
+python-dotenv
+pandas
+numpy
+pillow
