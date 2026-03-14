@@ -3,7 +3,13 @@ pinecone
 sentence-transformers
 google-genai
 langgraph
+langsmith
+langgraph-checkpoint-sqlite
+groq
+requests
+urllib3
 python-dotenv
 pandas
 numpy
 pillow
+plotly
